@@ -1,3 +1,7 @@
+unsloth_compiled_cache/
+wandb/
+grpo_trainer_lora_model/
+
 keys.yaml
 .swe-agent-human-history
 .vscode/**
