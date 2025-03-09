@@ -46,6 +46,18 @@ except ImportError:
 
 litellm.suppress_debug_info = True
 
+from datasets import Dataset
+
+try:
+    from trl import GRPOConfig, GRPOTrainer
+except ImportError:
+    GRPOConfig = None
+    GRPOTrainer = None
+
+try:
+    import wandb
+except ImportError:
+    wandb = None
 
 _THREADS_THAT_USED_API_KEYS = []
 """Keeps track of thread orders so that we can choose the same API key for the same thread."""
@@ -231,12 +243,35 @@ class HumanThoughtModelConfig(HumanModelConfig):
     model_config = ConfigDict(extra="forbid")
 
 
+class GRPOTrainingModelConfig(GenericAPIModelConfig):
+    """Configuration for GRPO training model"""
+
+    name: str = Field(description="grpo-<model_name>")
+
+    per_instance_cost_limit: float = Field(
+        default=0.0, description="Cost limit for every instance (task). This is a dummy value here."
+    )
+    total_cost_limit: float = Field(
+        default=0.0, description="Cost limit for all instances (tasks). This is a dummy value here."
+    )
+    cost_per_call: float = 0.0
+
+    model_config = ConfigDict(extra="forbid")
+
+    log_to_wandb: bool = Field(default=False, description="Whether to log to W&B")
+    wandb_run_name: str = Field(default="grpo-test", description="Name of the W&B run")
+    outputs_folder: Path = Field(default=Path("DEFAULT"), description="Path to save the outputs")
+    num_generations: int = Field(default=8, description="Number of generations to sample")
+    grpo_lora_rank: int = Field(default=64, description="Number of LoRA ranks to use")
+
+
 ModelConfig = Annotated[
     GenericAPIModelConfig
     | ReplayModelConfig
     | InstantEmptySubmitModelConfig
     | HumanModelConfig
-    | HumanThoughtModelConfig,
+    | HumanThoughtModelConfig
+    | GRPOTrainingModelConfig,
     Field(union_mode="left_to_right"),
 ]
 
@@ -783,6 +818,199 @@ class LiteLLMModel(AbstractModel):
         return messages
 
 
+class GRPOTrainingModel(AbstractModel):
+    """Model that wraps a local LLM and uses GRPO to train it on-the-fly with SWE agent interactions"""
+    
+    def __init__(self, args: GRPOTrainingModelConfig, tools: ToolConfig):
+        """Initialize with underlying model and GRPO trainer"""
+        print("GRPOTrainingModel.__init__: ", args)
+
+        from .grpo_utils import load_model_tokenizer, load_trainer, init_wandb
+
+        self.model, self.tokenizer = load_model_tokenizer(
+            model_name = args.name.replace("grpo-", ""),
+            max_seq_length = args.max_input_tokens,
+            lora_rank = args.grpo_lora_rank,
+        )
+        self.trainer = load_trainer(
+            model = self.model,
+            tokenizer = self.tokenizer,
+            num_generations = args.num_generations,
+            outputs_folder = args.outputs_folder,
+            run_name = args.wandb_run_name,
+            log_to_wandb = args.log_to_wandb,
+            max_prompt_length = 10_000,
+            max_completion_length = 200,
+            max_steps = 1,
+            # reward_funcs = args.reward_funcs,
+            # dataset = args.dataset,
+        )
+
+        self.log_to_wandb = args.log_to_wandb
+        self.num_generations = args.num_generations
+        init_wandb(
+            run_name = args.wandb_run_name,
+            training_args = self.trainer.args,
+            log_to_wandb = self.log_to_wandb,
+            entity = "rug-minds",
+            project = "GRPO-LLM",
+        )
+
+        self.config = args
+        self.stats = InstanceStats()
+        self.tools = tools
+        self.logger = get_logger("swea-grpo", emoji="🧠")
+        self.step = 0
+        # self.base_model = get_model(args.base_model_config, tools)
+        # self.training_examples = []
+        # self.training_lock = threading.Lock()
+
+    def _setup_trainer(self):
+        pass
+
+    def _history_to_messages(
+        self,
+        history: History,
+    ) -> list[dict[str, str]]:
+        history = copy.deepcopy(history)
+
+        def get_role(history_item: HistoryItem) -> str:
+            if history_item["role"] == "system":
+                return "user" if self.config.convert_system_to_user else "system"
+            return history_item["role"]
+
+        messages = []
+        for history_item in history:
+            role = get_role(history_item)
+            if role == "tool":
+                message = {
+                    "role": role,
+                    "content": history_item["content"],
+                    # Only one tool call per observations
+                    "tool_call_id": history_item["tool_call_ids"][0],  # type: ignore
+                }
+            elif (tool_calls := history_item.get("tool_calls")) is not None:
+                message = {"role": role, "content": history_item["content"], "tool_calls": tool_calls}
+            else:
+                message = {"role": role, "content": history_item["content"]}
+            if "cache_control" in history_item:
+                message["cache_control"] = history_item["cache_control"]
+            messages.append(message)
+        n_cache_control = str(messages).count("cache_control")
+        self.logger.debug(f"n_cache_control: {n_cache_control}")
+        return messages
+    
+    def _query(
+        self, messages: list[dict[str, str]], temperature: float | None = None,
+        reward_funcs = None,
+    ) -> list[dict]:
+        input_tokens: int = litellm.utils.token_counter(messages=messages, model=self.config.name)
+        self.logger.debug(f"# input_tokens: {input_tokens}")
+        if self.config.max_input_tokens is None:
+            msg = (
+                f"No max input tokens found for model {self.config.name!r}. "
+                "If you are using a local model, you can set `max_input_token` in the model config to override this."
+            )
+            self.logger.warning(msg)
+        elif input_tokens > self.config.max_input_tokens > 0:
+            msg = f"Input tokens {input_tokens} exceed max tokens {self.config.max_input_tokens}"
+            self.logger.warning(msg)
+            # TODO: raise exception in real implementation
+            # raise ContextWindowExceededError(msg)
+
+        extra_args = {}
+        # NOTE: tool use not supported for GRPO training
+        # if self.tools.use_function_calling:
+        #     extra_args["tools"] = self.tools.tools
+        completion_kwargs = self.config.completion_kwargs
+
+        try:
+            self.trainer.train_dataset = Dataset.from_dict({"prompt": [messages]})
+            def process_completion(completion, **kwargs):
+                return {"message": completion[-1]["content"]}
+            def process_completions(completions, **kwargs):
+                outputs = []
+                for completion in completions:
+                    outputs.append(process_completion(completion))
+                return outputs
+            responses = []
+            all_rewards = []
+            def reward_fn(completions, **kwargs):
+                responses.append(completions)
+                def reward_fn_single(model_response: dict):
+                    # from SWE-agent/sweagent/tools/parsing.py:125
+                    import re
+                    code_block_pat = re.compile(r"^```(\S*)\s*\n|^```\s*$", re.MULTILINE)
+                    stack = []
+                    last_valid_block = None
+                    for match in code_block_pat.finditer(model_response["message"]):
+                        if stack and not match.group(1):  # Closing of a code block
+                            start = stack.pop()
+                            # Check if it's not nested within another block
+                            if not stack:
+                                last_valid_block = (start, match)
+                        elif match.group(1) is not None:  # Opening of a code block
+                            stack.append(match)
+                    if last_valid_block:
+                        start, end = last_valid_block
+                        thought = model_response["message"][: start.start()] + model_response["message"][end.end() :]
+                        return 1.0
+                    return 0.0
+                rewards = [reward_fn_single(process_completion(c)) for c in completions]
+                all_rewards.append(rewards)
+                return rewards
+
+            self.trainer.reward_funcs = [reward_fn]
+            self.trainer.args.max_steps = self.step + 1
+            self.trainer.train(resume_from_checkpoint=(self.step > 0))
+            self.step += 1
+        except Exception as e:
+            print("models.py: Exception", e, str(e))
+            if "context" in str(e):
+                raise ContextWindowExceededError from e
+            raise
+
+        response = responses[0]
+        rewards = all_rewards[0]
+        self.logger.info(f"Response: {response}")
+        self.logger.info(f"Rewards: {rewards}")
+
+        # return the response with the highest reward
+        best_response = response[max(range(len(rewards)), key=lambda i: rewards[i])]
+        self.logger.info(f"Best response: {best_response}")
+        output = best_response[-1]["content"]
+        output_dict = {"message": output}
+        return output_dict
+
+    def query(self, history: History, temperature: float = 0.7) -> dict:
+        """Generate multiple responses, evaluate them, use for training, and return best one"""
+
+        messages = self._history_to_messages(history)
+        try:
+            result = self._query(messages, temperature=temperature)
+        except ContextWindowExceededError as e:
+            print("models.py: ContextWindowExceededError")
+            raise ContextWindowExceededError from e
+        
+        return result
+
+    def _execution_success_reward(self, response, result):
+        """Reward function based on successful execution"""
+        if result.get("success", False):
+            return 1.0
+        return -1.0
+        
+    def _format_reward(self, response, result):
+        """Reward function based on correct formatting"""
+        # Implement based on format correctness
+        pass
+        
+    def _cost_efficiency_reward(self, response, result):
+        """Reward based on token efficiency/cost"""
+        # Implement based on token counts
+        pass
+
+
 def get_model(args: ModelConfig, tools: ToolConfig) -> AbstractModel:
     """Returns correct model object given arguments and commands"""
     # Convert GenericAPIModelConfig to specific model config if needed
@@ -797,6 +1025,8 @@ def get_model(args: ModelConfig, tools: ToolConfig) -> AbstractModel:
             args = ReplayModelConfig(**args.model_dump())
         elif args.name == "instant_empty_submit":
             args = InstantEmptySubmitModelConfig(**args.model_dump())
+        elif args.name.startswith("grpo-"):
+            args = GRPOTrainingModelConfig(**args.model_dump())
 
     if args.name == "human":
         assert isinstance(args, HumanModelConfig), f"Expected {HumanModelConfig}, got {args}"
@@ -810,5 +1040,9 @@ def get_model(args: ModelConfig, tools: ToolConfig) -> AbstractModel:
     elif args.name == "instant_empty_submit":
         assert isinstance(args, InstantEmptySubmitModelConfig), f"Expected {InstantEmptySubmitModelConfig}, got {args}"
         return InstantEmptySubmitTestModel(args, tools)
+    elif args.name.startswith("grpo-"):
+        assert isinstance(args, GRPOTrainingModelConfig), f"Expected {GRPOTrainingModelConfig}, got {args}"
+        print("GRPOTrainingModel: ", args)
+        return GRPOTrainingModel(args, tools)
     assert isinstance(args, GenericAPIModelConfig), f"Expected {GenericAPIModelConfig}, got {args}"
     return LiteLLMModel(args, tools)
